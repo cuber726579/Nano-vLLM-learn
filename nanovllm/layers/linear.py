@@ -19,9 +19,9 @@ class LinearBase(nn.Module):
         tp_dim: int | None = None,
     ):
         super().__init__()
-        self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_dim = tp_dim # 指定按哪个维度切分权重
+        self.tp_rank = dist.get_rank() # 当前进程在tp维度上的rank
+        self.tp_size = dist.get_world_size() # tp维度的总进程数
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -64,9 +64,9 @@ class ColumnParallelLinear(LinearBase):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
-        shard_size = param_data.size(self.tp_dim)
+        shard_size = param_data.size(self.tp_dim) # <=> param_data.shape[self.tp_dim]
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+        loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size) # slice : tensor.narrow(dim, start, length) <=> tensor[:, start:start+length, ...] if dim=1
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

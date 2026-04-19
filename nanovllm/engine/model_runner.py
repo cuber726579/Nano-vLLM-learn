@@ -116,9 +116,10 @@ class ModelRunner:
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                # 将统一创建好的kv_cache分配给各个Attention
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+                layer_id += 1 # 每层(Hidden Layer)对应一个有k_cache和v_cache的Attention
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -127,16 +128,20 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        cu_seqlens_q = [0]
+        # 将所有序列里还未命中缓存的 prompt 后缀拼成一个变长 batch
+        input_ids = [] # 本轮需要prefill的token_id列表, 由多个sequence的token_id拼接起来
+        positions = [] # input_ids中各个token_id在对应序列中的位置, 以区分那一段token_ids对应哪个序列
+        # flash-attn 的变长接口需要 q/k 的累计长度。
+        cu_seqlens_q = [0] # 标志
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
+        # 本轮 prefill 新写入的每个 token 都需要映射到一个实际Block中的一个KV cache槽位
         slot_mapping = []
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
+            # 已经命中 prefix cache 的部分不用再算，只处理未命中的后缀。
             start = min(seq.num_cached_tokens, seqlen - 1)
             seqlen_q = seq.num_scheduled_tokens
             seqlen_k = seqlen
@@ -151,6 +156,7 @@ class ModelRunner:
                 continue
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
+            # 把本轮新计算出的 token 映射到 paged KV cache 中的绝对槽位。
             for i in range(start_block, end_block):
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
@@ -160,6 +166,7 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
+        # 当 k 总长度大于 q 总长度时，说明前缀已经在 KV cache 中，需要 block table 辅助 attention 访问。
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -167,6 +174,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # 将 prefill 阶段的元数据写入全局 context，供 attention 和 lm_head 使用。
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 

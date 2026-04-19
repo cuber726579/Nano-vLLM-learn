@@ -22,6 +22,8 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        "调度器优先做 prefill, 没有新 prefill 可做时, 再做 decode"
+        # prefill
         scheduled_seqs = []
         num_batched_tokens = 0
 

@@ -12,7 +12,7 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    block_size = 256
+    block_size = 256 # 每个块能存放多少个Token的KV序列，包括所有的层和所有的KV Head
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):

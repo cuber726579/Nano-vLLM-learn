@@ -1,10 +1,16 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
+hf_home = os.getenv("HF_HOME")
+
+from pathlib import Path
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    model_id = "Qwen/Qwen3-0.6B"
+    path = Path(hf_home) / "models" / model_id
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
