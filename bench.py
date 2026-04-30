@@ -12,8 +12,8 @@ from vllm import LLM, SamplingParams
 
 def main():
     seed(0)
-    num_seqs = 256
-    max_input_len = 1024
+    num_seqs = 256 # 256条请求
+    max_input_len = 1024 # 单条请求最大长度
     max_ouput_len = 1024
 
     model_id = "Qwen/Qwen3-0.6B-FP8"
@@ -23,7 +23,7 @@ def main():
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
     # uncomment the following line for vllm
-    prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+    # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
     llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()

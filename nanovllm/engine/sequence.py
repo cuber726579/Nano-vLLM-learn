@@ -20,10 +20,10 @@ class Sequence:
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
-        self.num_tokens = len(self.token_ids)
-        self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0    # tokens that don't need prefill
-        self.num_scheduled_tokens = 0
+        self.num_tokens = len(self.token_ids) # 初始提示词 + 已生成Token个数
+        self.num_prompt_tokens = len(token_ids) # 初始提示词Token个数
+        self.num_cached_tokens = 0 # Prefix Caching的Token数, 不需要再Prefill
+        self.num_scheduled_tokens = 0 # 当前轮次Prefill需要处理的Token数
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
