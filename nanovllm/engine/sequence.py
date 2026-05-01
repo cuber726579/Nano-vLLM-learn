@@ -91,10 +91,13 @@ class Sequence:
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):
+        """返回第 i 个 block 对应的 token 切片"""
         assert 0 <= i < self.num_blocks
+        # Slice token_ids by block index and block size.
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 
     def append_token(self, token_id: int):
+        """追加一个新生成的 token, 并同步更新序列状态。"""
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
