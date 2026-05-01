@@ -31,7 +31,7 @@ class Scheduler:
             # 还需要被 prefill 的 token 数。
             # 对普通 prefill 来说，这是“总 token - 已缓存 token”；
             # 对边界情况用 max(..., 1) 保证后续逻辑至少按 1 个 token 处理
-            num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
+            num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1) # 序列剩余待 prefill 的 token 数
             remaining = self.max_num_batched_tokens - num_batched_tokens # 当前 batch 还剩多少 token 预算
             # 没有 token 预算了，或者这是该序列第一次进入 prefill 且 KV block 不够分配，那么就停止继续往本轮 batch 里塞请求
             if remaining == 0 or (not seq.block_table and not self.block_manager.can_allocate(seq)):    # no budget
@@ -39,7 +39,7 @@ class Scheduler:
             # 如果剩余预算不足以完整容纳当前序列：
             # - 当本轮 batch 还是空的，允许把这第一条序列切成一个 chunk 来做 prefill；
             # - 当本轮已经有别的序列时，就不再切 chunk，直接停下，避免调度过碎。
-            if remaining < num_tokens and scheduled_seqs: # 简化: 每次调度只支持第一个超长序列的 Chunked Prefill
+            if remaining < num_tokens and scheduled_seqs: # 简化: 每次调度只支持第一个超长序列(len(seq) > self.max_num_batched_tokens)的 Chunked Prefill
                 break
             # 第一次调度这个序列时，先为它分配完整 block_table。
             # 后续 chunked prefill 只是逐步把 token 写入这些已分配好的 block。
