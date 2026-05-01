@@ -41,7 +41,8 @@ class Sequence:
         self.num_scheduled_tokens = 0 # 当前调度轮计划处理的 Token 数量
         
         self.block_table = [] 
-        # Paged Attention KV Cache 的块映射表，记录虚拟块到真实块的映射关系
+        # Paged Attention KV Cache 的块映射表, 记录虚拟块号到真实块号的映射关系
+        # 真实块号对应 model_runner.kv_cache 的第三个维度的索引
         # seq.block_table = [7, 12]
         # 序列的第 0 个逻辑 block 存在 KV cache 的物理 block 7
         # 序列的第 1 个逻辑 block 存在 KV cache 的物理 block 12
@@ -91,7 +92,7 @@ class Sequence:
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):
-        """返回第 i 个 block 对应的 token 切片"""
+        """返回第 i 个 block 对应的 tokens 切片"""
         assert 0 <= i < self.num_blocks
         # Slice token_ids by block index and block size.
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
