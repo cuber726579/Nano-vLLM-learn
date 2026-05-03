@@ -188,11 +188,12 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-       
+
         # prefix cache: 当 k 总长度大于 q 总长度时, 说明前缀已经在 KV cache 中, 需要 block table 辅助 attention 访问
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             # prefix cache 情况 slot_mapping 只包含新计算 tokens KV 的物理位置
-            block_tables = self.prepare_block_tables(seqs) 
+            # 不知道旧的 KV 序列存放位置, 所以需要 block_table进行查询
+            block_tables = self.prepare_block_tables(seqs)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
