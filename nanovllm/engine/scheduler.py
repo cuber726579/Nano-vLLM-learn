@@ -72,6 +72,9 @@ class Scheduler:
             # 后续 chunked prefill 只是逐步把 token 写入这些已分配好的 block.
             if not seq.block_table:
                 self.block_manager.allocate(seq)
+                # allocate 可能命中 prefix cache 并更新 num_cached_tokens,
+                # 因此需要重新计算本轮剩余待 prefill 的 token 数.
+                num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
             # 本轮真正执行的 token 数,不能超过“剩余待 prefill token”与“batch 剩余预算”的较小值.
             seq.num_scheduled_tokens = min(num_tokens, remaining)
 
