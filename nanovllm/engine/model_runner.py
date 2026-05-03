@@ -101,22 +101,33 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
+        """根据显存占用和模型配置分配 KV Cache"""
         config = self.config
         hf_config = config.hf_config
+
+        # 根据当前显存占用和峰值占用，估算还能留给 KV cache 的显存
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        # 每个 cache block 同时包含 K/V, 大小由层数, block_size, KV head 数和 head_dim 决定
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        
+        # 统一创建所有层共享布局的 KV cache, 再按 layer_id 切片分配给各层 Attention
+        self.kv_cache = torch.empty(
+            2, hf_config.num_hidden_layers,
+            config.num_kvcache_blocks, self.block_size,
+            num_kv_heads, head_dim
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                # 将统一创建好的kv_cache分配给各个Attention
+                # 将统一创建好的 KV Cache 分配给各个层中的 Attention
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1 # 每层(Hidden Layer)对应一个有k_cache和v_cache的Attention
@@ -128,20 +139,27 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
-        # 将所有序列里还未命中缓存的 prompt 后缀拼成一个变长 batch
-        input_ids = [] # 本轮需要prefill的token_id列表, 由多个sequence的token_id拼接起来
-        positions = [] # input_ids中各个token_id在对应序列中的位置, 以区分那一段token_ids对应哪个序列
-        # flash-attn 的变长接口需要 q/k 的累计长度。
-        cu_seqlens_q = [0] # 标志
-        cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        # 本轮 prefill 新写入的每个 token 都需要映射到一个实际Block中的一个KV cache槽位
-        slot_mapping = []
+        """
+        为 prefill 阶段准备模型输入和 attention 元数据
+
+        将多个序列中尚未命中 prefix cache 的 token 拼成一个变长 batch (N', D),
+        同时生成 token 位置, q/k 累计长度, 最大序列长度以及 KV cache 槽位映射.
+        如果存在已缓存前缀，则额外准备 block_tables, 方便 attention 读取历史 KV.
+        """
+        input_ids = [] # 本轮需要 prefill 的 token_ids, 由多个 sequence 的拼接起来
+        positions = [] # input_ids 中各个 token 在对应序列中的位置
+
+        # flash-attn 的变长接口需要 q/k 的累计长度
+        cu_seqlens_q = [0] # cu_seqlens_q[i], cu_seqlens_q[i+1] 表示 seq_i 中需要计算 query 的 tokens 起始位置
+        cu_seqlens_k = [0] # cu_seqlens_k[i], cu_seqlens_k[i+1] 表示 seq_i 中需要计算 key, value 的 tokens 起始位置, 因为 Attention 计算需要完整的 KV 向量, 所以二者相差 seqlen
+        max_seqlen_q = 0 # 统计各序列中最多的 Query Token 数
+        max_seqlen_k = 0 # 统计各序列中最多的 KV Token 数
+        slot_mapping = [] # 本轮 prefill 新写入的每个 token 都需要映射到一个实际 Block 中的一个 KVCache 槽位
         block_tables = None
+
         for seq in seqs:
             seqlen = len(seq)
-            # 已经命中 prefix cache 的部分不用再算，只处理未命中的后缀。
+            # 已经命中 prefix cache 的部分不用再算，只处理未命中的后缀
             start = min(seq.num_cached_tokens, seqlen - 1)
             seqlen_q = seq.num_scheduled_tokens
             seqlen_k = seqlen
@@ -152,11 +170,15 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
+            if not seq.block_table: # warmup
                 continue
+
+            # 计算序列需要用到的起始逻辑块号
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
-            # 把本轮新计算出的 token 映射到 paged KV cache 中的绝对槽位。
+            
+            # 把序列本轮新计算出的 token 映射到 paged KV cache 中的绝对槽位
+            # 槽位是把 KV cache 的 [block_id, token_offset] 两个维度展平后的线性槽位索引
             for i in range(start_block, end_block):
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
@@ -166,14 +188,18 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        # 当 k 总长度大于 q 总长度时，说明前缀已经在 KV cache 中，需要 block table 辅助 attention 访问。
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+       
+        # prefix cache: 当 k 总长度大于 q 总长度时, 说明前缀已经在 KV cache 中, 需要 block table 辅助 attention 访问
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+            # prefix cache 情况 slot_mapping 只包含新计算 tokens KV 的物理位置
+            block_tables = self.prepare_block_tables(seqs) 
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        
         # 将 prefill 阶段的元数据写入全局 context，供 attention 和 lm_head 使用。
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
@@ -197,6 +223,7 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
+        """收集每个序列的采样温度, 用于控制 token 的随机性"""
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
