@@ -12,7 +12,7 @@ class Scheduler:
     这个调度器采用 V0 风格的阶段式调度:
     1. 新请求先进入 waiting 队列, 等待 prompt prefill;
     2. prefill 完成后转入 running 队列, 后续参与 decode;
-    3. decode 生成结束后释放 KV cache, 并从 running 中移除
+    3. decode 生成结束后释放 KV cache, 并从 running 中移除.
 
     调度器同时负责和 BlockManager 协作, 为 prefill/decode 阶段分配, 追加或释放 KV cache block
     """
