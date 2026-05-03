@@ -193,7 +193,7 @@ class BlockManager:
             assert last_block.hash == -1
 
     def deallocate(self, seq: Sequence):
-        """释放一个 Sequence 占用或引用的所有物理 block"""
+        """释放一个 Sequence 占用: 释放引用的所有物理块"""
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
