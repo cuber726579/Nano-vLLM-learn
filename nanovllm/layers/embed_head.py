@@ -83,6 +83,13 @@ class VocabParallelEmbedding(nn.Module):
 
 
 class ParallelLMHead(VocabParallelEmbedding):
+    """
+    按词表维度切分的 LM Head
+
+    该层复用 VocabParallelEmbedding 的权重形状和加载逻辑, 但 forward 中执行
+    hidden states 到 vocab logits 的线性投影. 每个 tensor parallel rank 只计算
+    自己负责的 vocab 分片 logits, 最后收集到 rank 0 并拼成完整 vocab logits.
+    """
 
     def __init__(
         self,
@@ -90,10 +97,25 @@ class ParallelLMHead(VocabParallelEmbedding):
         embedding_dim: int,
         bias: bool = False,
     ):
+        """
+        Args:
+            num_embeddings: 完整词表大小
+            embedding_dim: hidden states 的隐藏维度
+            bias: LM Head 是否使用 bias, 当前实现不支持 bias
+        """
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
+        """
+        将 hidden states 投影为 vocab logits
+
+        Args:
+            x: 模型输出的 hidden states
+
+        Returns:
+            rank 0 上返回完整 vocab logits; 其他 rank 在 tensor parallel 时返回 None.
+        """
         context = get_context()
         if context.is_prefill:
             # 在 Prefill 阶段, 只取每段 Seq 的最后一个 Token 作为输出
@@ -101,6 +123,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
+            # 每个 rank 只得到局部 vocab logits, 收集到 rank 0 后沿 vocab 维度拼接
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
