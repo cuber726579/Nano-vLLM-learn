@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from contextlib import contextmanager
 
 
 def divide(numerator, denominator):
@@ -77,18 +78,17 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 每个 rank 都有完整参数, 因此这里不需要 collective 通信.
+        # 每个 rank 都有完整参数, 因此这里不需要 collective 通信
         return F.linear(x, self.weight, self.bias)
 
 
 class ColumnParallelLinear(LinearBase):
     """
-    按输出维度切分的并行线性层.
+    按输出维度切分的并行线性层
 
     完整 Linear 的权重形状是 [output_size, input_size].
     Column Parallel 会沿着 output_size 维度切分权重, 也就是每个 rank
-    只保存一部分输出通道对应的权重行:
-        local_weight: [output_size / tp_size, input_size]
+    只保存一部分输出通道对应的权重行: local_weight: [output_size / tp_size, input_size]
 
     forward 时每个 rank 都接收完整输入 x, 但只计算自己的局部输出.
     因为输出本来就是按最后一维分片的, 所以这里不需要 all_reduce.
@@ -155,16 +155,17 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         """
-        将某个合并前线性层的权重加载到合并参数的对应局部区域.
+        将某个合并前线性层的权重加载到切分后的参数 param 的对应局部区域
 
         loaded_shard_id 表示当前 loaded_weight 属于第几个原始线性层.
+        param 需要保存不同 loaded_shard_id Linear 中属于自己 TP 的权重.
         例如 gate/up 合并时:
             loaded_shard_id=0 表示 gate_proj
             loaded_shard_id=1 表示 up_proj
         """
         param_data = param.data
 
-        # 在当前 rank 的合并参数中, 找到该 shard 应该写入的局部偏移和大小.
+        # 在当前 rank 的切分参数中, 找到该 shard 应该写入的局部偏移和大小.
         # 因为 param_data 已经是 TP 切分后的局部参数, 所以 offset/size 也要除以 tp_size.
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
@@ -172,6 +173,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         # loaded_weight 是 HF 中该原始线性层的完整权重.
         # 沿输出维切成 tp_size 份后, 只取当前 rank 负责的输出通道.
+        # 每个线性层的原始权重沿输出维度, 均分在各 TP 中
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
@@ -270,7 +272,7 @@ class RowParallelLinear(LinearBase):
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        """从完整权重中切出当前 rank 负责的输入通道分片."""
+        """从完整权重中切出当前 rank 负责的输入通道分片"""
         param_data = param.data
 
         # bias 不沿输入维切分, 每个 rank 都能加载完整 bias.
@@ -300,6 +302,28 @@ class RowParallelLinear(LinearBase):
         return y
 
 
+@contextmanager
+def _mock_tp_env(rank: int, tp_size: int, all_reduce=None):
+    """
+    在单进程证明函数里模拟当前 TP rank.
+
+    这些证明函数的目标是验证本文件中的真实 Linear 类, 不启动真正的多进程
+    process group. 因此这里只替换构造模块时依赖的 rank/world_size 查询.
+    """
+    original_get_rank = dist.get_rank
+    original_get_world_size = dist.get_world_size
+    original_all_reduce = dist.all_reduce
+    dist.get_rank = lambda: rank
+    dist.get_world_size = lambda: tp_size
+    if all_reduce is not None:
+        dist.all_reduce = all_reduce
+    try:
+        yield
+    finally:
+        dist.get_rank = original_get_rank
+        dist.get_world_size = original_get_world_size
+        dist.all_reduce = original_all_reduce
+
 
 def _replicated_linear_output(
     x: torch.Tensor,
@@ -310,9 +334,14 @@ def _replicated_linear_output(
     ReplicatedLinear 的参考输出.
 
     ReplicatedLinear.forward 本质上就是 F.linear(x, weight, bias).
-    这里不用真正构造 ReplicatedLinear, 可以避免依赖已初始化的 dist process group.
+    这里真实构造 ReplicatedLinear, 让参考结果也走本文件中的类实现.
     """
-    return F.linear(x, weight, bias)
+    with _mock_tp_env(rank=0, tp_size=1):
+        layer = ReplicatedLinear(weight.size(1), weight.size(0), bias is not None)
+        layer.weight.weight_loader(layer.weight, weight)
+        if bias is not None:
+            layer.bias.weight_loader(layer.bias, bias)
+        return layer(x)
 
 
 def prove_column_parallel_linear_equivalence() -> bool:
@@ -334,9 +363,11 @@ def prove_column_parallel_linear_equivalence() -> bool:
 
     local_outputs = []
     for rank in range(tp_size):
-        local_weight = weight.chunk(tp_size, dim=0)[rank]
-        local_bias = bias.chunk(tp_size, dim=0)[rank]
-        local_outputs.append(F.linear(x, local_weight, local_bias))
+        with _mock_tp_env(rank, tp_size):
+            layer = ColumnParallelLinear(input_size, output_size, bias=True)
+            layer.weight.weight_loader(layer.weight, weight)
+            layer.bias.weight_loader(layer.bias, bias)
+            local_outputs.append(layer(x))
 
     # 模拟 ColumnParallelLinear 输出散落在不同 rank 后, 通过 all_gather 拼回完整输出.
     y_tp = torch.cat(local_outputs, dim=-1)
@@ -356,7 +387,7 @@ def prove_merged_column_parallel_linear_equivalence() -> bool:
     再拼成 [full_gate, full_up].
     """
     torch.manual_seed(0)
-    batch_size, input_size, tp_size = 3, 8, 3
+    batch_size, input_size, tp_size = 3, 6, 3
     output_sizes = [12, 12]
     output_size = sum(output_sizes)
     x = torch.randn(batch_size, input_size)
@@ -367,16 +398,16 @@ def prove_merged_column_parallel_linear_equivalence() -> bool:
 
     local_outputs = []
     for rank in range(tp_size):
-        local_weights = []
-        local_biases = []
-        offset = 0
-        for shard_output_size in output_sizes:
-            shard_weight = weight.narrow(0, offset, shard_output_size)
-            shard_bias = bias.narrow(0, offset, shard_output_size)
-            local_weights.append(shard_weight.chunk(tp_size, dim=0)[rank])
-            local_biases.append(shard_bias.chunk(tp_size, dim=0)[rank])
-            offset += shard_output_size
-        local_outputs.append(F.linear(x, torch.cat(local_weights, dim=0), torch.cat(local_biases, dim=0)))
+        with _mock_tp_env(rank, tp_size):
+            layer = MergedColumnParallelLinear(input_size, output_sizes, bias=True)
+            offset = 0
+            for shard_id, shard_output_size in enumerate(output_sizes):
+                shard_weight = weight.narrow(0, offset, shard_output_size)
+                shard_bias = bias.narrow(0, offset, shard_output_size)
+                layer.weight.weight_loader(layer.weight, shard_weight, shard_id)
+                layer.bias.weight_loader(layer.bias, shard_bias, shard_id)
+                offset += shard_output_size
+            local_outputs.append(layer(x))
 
     # 每个 rank 的 local_output 是 [local_shard_0, local_shard_1, ...].
     local_sizes = [size // tp_size for size in output_sizes]
@@ -418,12 +449,18 @@ def prove_qkv_parallel_linear_equivalence() -> bool:
 
     local_outputs = []
     for rank in range(tp_size):
-        local_weight = torch.cat([
-            q_weight.chunk(tp_size, dim=0)[rank],
-            k_weight.chunk(tp_size, dim=0)[rank],
-            v_weight.chunk(tp_size, dim=0)[rank],
-        ], dim=0)
-        local_outputs.append(F.linear(x, local_weight))
+        with _mock_tp_env(rank, tp_size):
+            layer = QKVParallelLinear(
+                hidden_size,
+                head_size,
+                total_num_heads,
+                total_num_kv_heads,
+                bias=False,
+            )
+            layer.weight.weight_loader(layer.weight, q_weight, "q")
+            layer.weight.weight_loader(layer.weight, k_weight, "k")
+            layer.weight.weight_loader(layer.weight, v_weight, "v")
+            local_outputs.append(layer(x))
 
     # 每个 rank 的 local_output 是 [local_q, local_k, local_v],
     # 恢复完整输出时需要分别 gather Q/K/V, 再拼成 [full_q, full_k, full_v].
@@ -460,11 +497,11 @@ def prove_row_parallel_linear_equivalence() -> bool:
     local_outputs = []
     for rank in range(tp_size):
         local_x = x.chunk(tp_size, dim=-1)[rank]
-        local_weight = weight.chunk(tp_size, dim=1)[rank]
-
-        # bias 只在一个 rank 上加一次, 否则 all_reduce 后会重复加 tp_size 次.
-        local_bias = bias if rank == 0 else None
-        local_outputs.append(F.linear(local_x, local_weight, local_bias))
+        with _mock_tp_env(rank, tp_size, all_reduce=lambda tensor: tensor):
+            layer = RowParallelLinear(input_size, output_size, bias=True)
+            layer.weight.weight_loader(layer.weight, weight)
+            layer.bias.weight_loader(layer.bias, bias)
+            local_outputs.append(layer(local_x))
 
     # 模拟 RowParallelLinear.forward 里的 dist.all_reduce(sum).
     y_tp = sum(local_outputs)
