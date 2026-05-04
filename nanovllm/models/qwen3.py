@@ -203,9 +203,14 @@ class Qwen3ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.model = Qwen3Model(config)
+
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
+        if config.tie_word_embeddings: # Token Embedding 和 LM Head 参数绑定
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        # 参数一样, 但是使用方法不同
+        # Embedding:  W[token_id]       查表取某一行
+        # LM Head:    hidden @ W.T      和每个词向量做相似度打分
+
 
     def forward(
         self,

@@ -7,38 +7,78 @@ from nanovllm.utils.context import get_context
 
 
 class VocabParallelEmbedding(nn.Module):
+    """
+    按词表维度切分的 Embedding 层
+
+    每个 tensor parallel rank 只保存完整 vocab 的一段 embedding 权重.
+    forward 时, 当前 rank 只处理落在自己 vocab 范围内的 token, 最后通过
+    all_reduce 汇总所有 rank 的 embedding 结果.
+    """
 
     def __init__(
         self,
         num_embeddings: int,
         embedding_dim: int,
     ):
+        """
+        Args:
+            num_embeddings: 完整词表大小
+            embedding_dim: 每个 token embedding 的隐藏维度
+        """
         super().__init__()
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
+        # 当前 rank 负责的 vocab 范围: [vocab_start_idx, vocab_end_idx)
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """
+        加载当前 rank 对应的 embedding 权重分片
+
+        Args:
+            param: 当前模块的 self.weight 参数
+            loaded_weight: safetensors 中读取到的完整 embedding 权重
+        """
         param_data = param.data
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+
+        # narrow(0, start_idx, shard_size) : loaded_weight[start_idx:start_idx + shard_size,]
+        # 沿0维度进行切片, 从索引 start_idx开始, 切大小为 shard_size 的部分
+        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size) 
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
+        """
+        根据 token id 查表得到 hidden states
+
+        Args:
+            x: 输入 token ids
+
+        Returns:
+            与输入 token ids 对应的 embedding hidden states
+        """
         if self.tp_size > 1:
+            # 掩码不属于当前 rank 的 token
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
+
+            # 全局 token id 转成局部 vocab id
+            # 通过 mask 把不属于当前 rank 的位置置 0
+            # 否则不属于当前 rank 的位置查表可能出现越界
             x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
-            y = mask.unsqueeze(1) * y
-            dist.all_reduce(y)
+            y = mask.unsqueeze(1) * y # 非当前 rank 负责的 token 置零
+
+            # 通过 all_reduce 对各个 rank 的结果求和, 合并所有 rank 的结果
+            # 上述两次 mask 操作已经保证非当前 rank 处理的位置, 都为 0
+            dist.all_reduce(y) 
         return y
 
 
