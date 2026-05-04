@@ -83,6 +83,14 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        """
+        调用当前 ModelRunner 的指定方法 (run/exit)
+
+        主进程在 llm_engine.step 中首次调用该函数,
+        在 tensor parallel 模式下, 会先把方法名和参数写入共享内存,
+        并通过 Event 唤醒其他正在 self.loop 等待的 rank, 让所有 rank 执行同一个方法,
+        随后主进程也执行该方法并返回结果.
+        """
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
