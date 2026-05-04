@@ -56,6 +56,7 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_prefill:
+            # 在 Prefill 阶段, 只取每段 Seq 的最后一个 Token 作为输出
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
