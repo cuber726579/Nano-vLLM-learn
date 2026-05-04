@@ -186,6 +186,9 @@ class Qwen3Model(nn.Module):
 class Qwen3ForCausalLM(nn.Module):
     # 权重加载映射表: HF 原始权重中线性层可能分别定义, 
     # 推理框架处于推理效率的考虑, 合并为一个大线性层
+    # 键: HF 原始权重名中的关键字段, 比如 q_proj, k_proj, gate_proj
+    # 值1: 推理框架里合并后的模块名字段, 比如 qkv_proj, gate_up_proj
+    # 值2: 传给框架内模块参数 weight_loader 的分片标识, 来说明这份 HF 权重应该写入合并参数的哪一部分
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
