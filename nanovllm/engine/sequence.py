@@ -115,7 +115,3 @@ class Sequence:
         else:
             self.token_ids = []
             self.last_token = last_state
-
-if __name__ == "__main__":
-    status = SequenceStatus.WAITING
-    print(status)
