@@ -97,15 +97,21 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
+        """用一组假序列预热模型，并记录非 KV cache 部分的显存峰值"""
+        # 清理初始化/加载模型过程中遗留的缓存，并从这里开始统计一次前向的峰值显存
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+
+        # 构造一个尽量接近调度上限的 prefill batch
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
-            seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+            seq.num_scheduled_tokens = seq_len # 调度各 seq 的所有 token
+        self.run(seqs, is_prefill=True) # 使用 compute-bound 的 prefill 进行 warmup
+
+        # 释放 warmup 产生的临时张量；峰值统计仍会保留给 allocate_kv_cache 使用
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -120,7 +126,7 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         # 每个 cache block 同时包含 K/V, 大小由层数, block_size, KV head 数和 head_dim 决定
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size # 把总的 kv_heads 分到不同 TP 上
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
