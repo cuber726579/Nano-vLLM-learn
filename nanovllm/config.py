@@ -9,7 +9,7 @@ class Config:
     max_num_batched_tokens: int = 16384 # Scheduler 中单次调度 batch 中允许处理的最大 token 数（调度budget）
     max_num_seqs: int = 512 # Scheduler 中单次调度 batch 中允许并发处理的最大序列数
     
-    max_model_len: int = 4096 # 单条序列的最大上下文(Prompt+Generate)长度，受限于模型的最大上下文大小
+    max_model_len: int = 4096 # 单条序列的最大上下文(Prompt+Generate) token 长度，受限于模型的最大上下文大小
     # prompt_tokens + max_tokens <= config.max_model_len
 
     gpu_memory_utilization: float = 0.9 # 最大显存利用率，包括模型占用和生成过程中 KV cache 的占用
