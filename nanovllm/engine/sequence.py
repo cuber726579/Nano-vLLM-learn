@@ -58,6 +58,8 @@ class Sequence:
         return self.num_tokens
 
     def __getitem__(self, key):
+        """支持按索引或切片访问序列中的 token ID"""
+        # 例如 seq[i] 或 seq[start:end]
         return self.token_ids[key]
 
     @property

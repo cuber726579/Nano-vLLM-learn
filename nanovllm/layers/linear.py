@@ -36,7 +36,7 @@ class LinearBase(nn.Module):
         self.tp_size = dist.get_world_size() # tp维度的总进程数
 
         # PyTorch Linear 的权重布局是 [out_features, in_features].
-        # 这里的 input_size/output_size 可能已经是子类切分后的局部尺寸.
+        # 这里的 output_size 已经是子类切分后的局部尺寸
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
 
         # 给 Parameter 动态挂载 weight_loader.
@@ -101,9 +101,9 @@ class ColumnParallelLinear(LinearBase):
     ):
         tp_size = dist.get_world_size()
         # 当前 rank 只持有 output_size / tp_size 个输出通道.
-        # tp_dim=0 表示加载权重时沿 weight 的第 0 维切分
+        # tp_dim=0 表示加载权重时沿 weight 的第 0 维 output_dim 切分
         # 第 0 维: output_dim/正常矩阵乘法中的列方向
-        super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+        super().__init__(input_size, divide(output_size, tp_size), bias, tp_dim=0)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         """从完整权重中切出当前 rank 负责的输出通道分片"""
@@ -210,7 +210,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         #   Q: total_num_heads * head_size
         #   K: total_num_kv_heads * head_size
         #   V: total_num_kv_heads * head_size
-        # super().__init__ 会再把这个 output_size 按 tp_size 切成局部输出大小.
+        # super().__init__ 会再把这个 output_size 按 tp_size 切成局部输出大小
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
 
@@ -267,8 +267,8 @@ class RowParallelLinear(LinearBase):
         tp_size = dist.get_world_size()
 
         # 当前 rank 只持有 input_size / tp_size 个输入通道对应的权重列.
-        # tp_dim=1 表示加载权重时沿 weight 的第 1 维切分.
-        super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        # tp_dim=1 表示加载权重时沿 weight 的第 1 维 input_dim 切分.
+        super().__init__(divide(input_size, tp_size), output_size, bias, tp_dim=1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         """从完整权重中切出当前 rank 负责的输入通道分片"""

@@ -117,7 +117,7 @@ class Attention(nn.Module):
         num_kv_heads,
     ):
         super().__init__()
-        self.num_heads = num_heads
+        self.num_heads = num_heads # 已经考虑了 tp_size
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
