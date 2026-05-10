@@ -106,6 +106,39 @@ def store_kvcache(
         DEBUG=debug,
     )
 
+def store_kvcache_simplified(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+):
+    """
+    用 PyTorch 写出的 KV cache 存储逻辑，便于理解 Triton 版本 store_kvcache 的作用。
+
+    参数:
+        key: 当前步计算的 Key 张量, shape 为 [N, num_heads, head_dim]
+        value: 当前步计算的 Value 张量, shape 为 [N, num_heads, head_dim]
+        k_cache: Key 缓存, shape 为 [num_blocks, block_size, num_heads, head_dim]
+        v_cache: Value 缓存, shape 与 k_cache 相同
+        slot_mapping: 指示每个 token 应该存储在缓存中的哪个线性槽位, shape 为 [N]
+    """
+    N, num_heads, head_dim = key.shape
+    assert value.shape == key.shape
+    assert k_cache.shape == v_cache.shape
+    assert k_cache.shape[-2:] == (num_heads, head_dim)
+    assert slot_mapping.numel() == N
+
+    flat_k_cache = k_cache.view(-1, num_heads, head_dim)
+    flat_v_cache = v_cache.view(-1, num_heads, head_dim)
+
+    for i in range(N):
+        slot = slot_mapping[i].item()
+        if slot == -1:
+            continue
+        flat_k_cache[slot] = key[i]
+        flat_v_cache[slot] = value[i]
+
 
 class Attention(nn.Module):
 
