@@ -91,6 +91,7 @@ class Sequence:
     @property
     def last_block_num_tokens(self):
         """当前序列最后一个 block 中已经存放的 token 数量"""
+        # 主要用于 Prepare Decode 中的 Slot Mapping 计算
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):

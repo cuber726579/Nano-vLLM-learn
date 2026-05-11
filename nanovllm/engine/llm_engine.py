@@ -41,7 +41,7 @@ class LLMEngine:
 
         self.scheduler = Scheduler(config)
 
-        # 进程退出时自动释放 ModelRunner 和子进程, 避免 tensor parallel 子进程残留
+        # 程序退出时自动释放 ModelRunner 和子进程, 避免 tensor parallel 子进程残留
         atexit.register(self.exit)
 
     def exit(self):

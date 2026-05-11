@@ -38,22 +38,23 @@ def store_kvcache_kernel(
             slot_mapping[idx] 表示第 idx 个 token 的 KV 要写入哪个线性物理槽位。
         D: 一个 token 在当前层上的 KV 向量长度, D = num_kv_heads * head_dim。
     """
-    # 一个 Triton program 对应一个 token 的 K/V 写入任务
-    idx = tl.program_id(0)
-    # 读取第 idx 个 token 应写入的目标槽位
-    slot = tl.load(slot_mapping_ptr + idx)
-    # -1 表示这个位置无需写入，直接跳过
-    if slot == -1: return
+    idx = tl.program_id(0) # 第 idx 个 Triton program 对应第 idx 个 token 的 K/V 写入任务
+    slot = tl.load(slot_mapping_ptr + idx) # 读取第 idx 个 token 应写入的目标槽位
+    if slot == -1: return # -1 表示这个位置无需写入，直接跳过
     if DEBUG:
         tl.device_print("store_kvcache idx/slot", idx, slot)
+
     # 计算 key/value 中第 idx 个 token 的整段向量地址范围
     key_offsets = idx * key_stride + tl.arange(0, D)
     value_offsets = idx * value_stride + tl.arange(0, D)
+
     # 将当前 token 的整段 K/V 从寄存器前的全局内存读出
     key = tl.load(key_ptr + key_offsets)
     value = tl.load(value_ptr + value_offsets)
+
     # 线性槽位 slot 展开后对应 cache 中一段长度为 D 的连续地址
     cache_offsets = slot * D + tl.arange(0, D)
+
     # 将当前 token 的整段 K/V 写入目标物理槽位
     tl.store(k_cache_ptr + cache_offsets, key)
     tl.store(v_cache_ptr + cache_offsets, value)
@@ -85,15 +86,21 @@ def store_kvcache(
     # N 是本轮待写入 token 数, D 是单个 token 在该层上的扁平 KV 长度
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
+
     # 保证最后一维连续，便于把 [num_heads, head_dim] 视作一段长度 D 的向量
     assert key.stride(-1) == 1 and value.stride(-1) == 1
+
     # 保证相邻两个 head 之间紧邻排布，没有额外空洞
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
+
     # 保证 cache 中相邻两个 token 槽位正好间隔 D 个元素
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
+
     # 每个待写入 token 都必须有一个对应槽位
     assert slot_mapping.numel() == N
-    # 启动 N 个 Triton program, 分别负责 N 个 token 的写入, 并传入第 0 维 stride 作为逐 token 访存步长
+
+    # 启动 N 个 Triton program, 分别负责 N 个 token 的写入, 
+    # 并传入第 0 维 stride 作为逐 token 访存步长
     store_kvcache_kernel[(N,)](
         key,
         key.stride(0),
