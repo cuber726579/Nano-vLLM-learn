@@ -13,23 +13,54 @@ from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
+    """
+    单个 rank 上的模型执行器
+
+    ModelRunner 负责在当前 GPU 上创建模型分片, 加载权重, 预热模型, 分配 KV cache,
+    并在推理时执行 prefill/decode. tensor parallel 模式下每个 rank 都会创建一个
+    ModelRunner, 共同参与一次 forward 中的分布式计算. 
+
+    rank 0 是主执行器: 由 LLMEngine.__init__ 直接调用, 负责把 run/exit 等命令写入共享内存,
+    唤醒其他 rank, 并负责最终采样返回 token ids. 
+
+    rank > 0 是子执行器: 初始化完成后进入 loop 阻塞等待, 每次被 rank 0 唤醒后从
+    共享内存读取命令, 在自己的 GPU 上执行同样的方法. 
+    """
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        """
+        初始化当前 rank 的模型执行环境. 
+
+        参数:
+            config: 推理引擎配置, 包含模型路径, 并行度, KV cache 大小, CUDA graph 开关等. 
+            rank: 当前进程在 tensor parallel 进程组中的 rank, 同时对应使用的 CUDA 设备编号. 
+            event: 多卡模式下用于唤醒子进程的同步事件. rank 0 持有所有子进程的 Event 列表,
+                rank > 0 持有自己的 Event. 
+
+        初始化流程:
+            1. 初始化 torch.distributed 进程组, 并将当前进程绑定到对应 GPU. 
+            2. 在 GPU 上创建模型, 加载当前 rank 负责的权重分片. 
+            3. 预热模型, 根据显存余量分配 KV cache, 必要时捕获 decode CUDA graph. 
+            4. 多卡模式下建立共享内存通信: rank 0 创建共享内存并返回给 LLMEngine,
+               rank > 0 打开共享内存后进入 loop 等待 rank 0 下发命令. 
+        """
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
-        self.rank = rank
+        self.world_size = config.tensor_parallel_size # 张量并行大小/GPU数
+        self.rank = rank # 当前 GPU 的 rank/id
         self.event = event
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
+        torch.set_default_device("cuda") # 设置默认设备为 CUDA, 将模型创建在GPU上
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -40,14 +71,22 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
+                # 主进程创建共享内存, 并等待其他 rank 加入
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
+                # Model Runner 初始化完成, 继续执行 llm_engine 其他代码
             else:
-                dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
-                self.loop()
+                dist.barrier() # 等待主进程创建共享内存
+                self.shm = SharedMemory(name="nanovllm") # 非主进程打开共享内存
+                self.loop() # 非主进程进入循环, 阻塞等待主进程调用方法
 
     def exit(self):
+        """
+        释放当前 rank 持有的分布式和 GPU 资源. 
+
+        多卡模式下所有 rank 都先关闭共享内存句柄, 再通过 barrier 等待彼此完成关闭;
+        只有 rank 0 负责 unlink 共享内存名称, 避免子进程还在使用时提前删除. 
+        """
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -59,6 +98,12 @@ class ModelRunner:
         dist.destroy_process_group()
 
     def loop(self):
+        """
+        子进程主循环. 
+
+        rank > 0 初始化完成后会停在这里, 等待 rank 0 通过共享内存和 Event 下发命令. 
+        每次读取到的方法名和参数后, 在当前 rank 上执行同名方法; 收到 exit 后退出循环. 
+        """
         while True:
             method_name, args = self.read_shm()
             self.call(method_name, *args)
@@ -66,21 +111,35 @@ class ModelRunner:
                 break
 
     def read_shm(self):
+        """
+        子进程从共享内存读取 rank 0 下发的调用请求. 
+
+        共享内存前 4 个字节保存序列化数据长度, 后续字节保存 pickle 后的
+        [method_name, *args]. Event 用于让子进程阻塞等待, 避免不停轮询共享内存. 
+        """
         assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
+        self.event.wait() # 阻塞: 等待 rank 0 写入新命令并调用 event.set()
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+        # 当前命令已读取, 清除事件状态, 等待下一次唤醒
         self.event.clear()
         return method_name, args
 
     def write_shm(self, method_name, *args):
+        """
+        rank 0 将一次方法调用写入共享内存, 并唤醒所有子进程. 
+
+        method_name 通常是 run 或 exit. 参数通过 pickle 序列化后写入共享内存,
+        每个子进程被对应的 Event 唤醒后会读取同一份数据并在本 rank 执行. 
+        """
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
+        # 用前 4 个字节记录 payload 长度, 方便子进程知道应该读取多少字节
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
-            event.set()
+            event.set() # 唤醒所有子进程, 读取新命令执行
 
     def call(self, method_name, *args):
         """
@@ -215,7 +274,7 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         
-        # 将 prefill 阶段的元数据写入全局 context，供 attention 和 lm_head 使用。
+        # 将 prefill 阶段的元数据写入全局 context，供 attention 和 lm_head 使用. 
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
@@ -223,17 +282,19 @@ class ModelRunner:
         input_ids = []
         positions = []
         slot_mapping = []
-        context_lens = []
+        context_lens = [] # 使用 context_lens 描述每条 seq 当前上下文长度
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
+
+            # 最新一个 Token 的 Slot Mapping
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self.prepare_block_tables(seqs) # Decode 阶段必须使用 Block Table 来访问历史 Token 的 KV
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
